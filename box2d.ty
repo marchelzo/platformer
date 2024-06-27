@@ -1,0 +1,674 @@
+import ffi as c (C!)
+import ptr
+import math (atan2, pi)
+
+let $box2d = c.dlopen('libbox2d.dylib')
+let b2_maxPolygonVertices = 8
+
+let drawPoly = nil
+let drawText = nil
+let debugDraw = nil
+
+pub b2_staticBody = 0
+/// zero mass, velocity set by user, moved by solver
+pub b2_kinematicBody = 1
+/// positive mass, velocity determined by forces, moved by solver
+pub b2_dynamicBody = 2
+/// number of body types
+pub b2_bodyTypeCount = 3
+
+C! struct b2WorldId {
+	c.u16 index1;
+	c.u16 revision;
+}
+
+/// Body id references a body instance. This should be treated as an opaque handle.
+C! struct b2BodyId {
+	c.i32 index1;
+	c.u16 world0;
+	c.u16 revision;
+}
+
+/// Shape id references a shape instance. This should be treated as an opaque handle.
+C! struct b2ShapeId
+{
+	c.i32 index1;
+	c.u16 world0;
+	c.u16 revision;
+}
+
+/// Joint id references a joint instance. This should be treated as an opaque handle.
+C! struct b2JointId {
+	c.i32 index1;
+	c.u16 world0;
+	c.u16 revision;
+}
+
+/// Chain id references a chain instances. This should be treated as an opaque handle.
+C! struct b2ChainId {
+	c.i32 index1;
+	c.u16 world0;
+	c.u16 revision;
+}
+
+C! struct b2Vec2 {
+	c.float x, y;
+}
+
+/// 2D rotation
+/// This is similar to using a complex number for rotation
+C! struct b2Rot {
+	/// cosine and sine
+	c.float c, s;
+}
+
+/// A 2D rigid transform
+C! struct b2Transform {
+	b2Vec2_C p;
+	b2Rot_C q;
+}
+
+C! struct b2AABB {
+	b2Vec2_C upperBound;
+	b2Vec2_C lowerBound;
+}
+
+C! closure drawPolygon(verts: c.ptr, count: c.int, color: c.u32, context: c.ptr) -> c.void {
+    if not let $draw = drawPoly {
+        return
+    }
+
+    let poly = []
+    let verts = ptr.typed(verts, b2Vec2_C)
+
+    for i in ..count {
+        let vert = b2Vec2(verts + i)
+        poly.push((vert.x, vert.y))
+    }
+
+    let color = ((color >> 16) .&. 0xFF, (color >> 8) .&. 0xFF, color .&. 0xFF)
+    draw(poly, color)
+}
+
+C! closure drawSolidPolygon(transform: b2Transform_C, verts: c.ptr, count: c.int, color: c.u32, context: c.ptr) -> c.void {
+    if not let $draw = drawPoly {
+        return
+    }
+
+    let poly = []
+    let verts = ptr.typed(verts, b2Vec2_C)
+
+    for i in ..count {
+        let vert = b2Vec2(verts + i)
+        poly.push((vert.x + transform[0][0], vert.y + transform[0][1]))
+    }
+
+    let color = ((color >> 16) .&. 0xFF, (color >> 8) .&. 0xFF, color .&. 0xFF)
+    draw(poly, color)
+}
+
+C! closure drawCircle(center: b2Vec2_C, radius: c.float, color: c.u32, context: c.ptr) -> c.void { print('DRAW CIRCLE') }
+C! closure drawSolidCircle(transform: b2Transform_C, center: b2Vec2_C, radius: c.float, color: c.u32, context: c.ptr) -> c.void { print('DRAW SOLID CIRCLE') }
+C! closure drawCapsule(p1: b2Vec2_C, p2: b2Vec2_C, radius: c.float, color: c.u32, context: c.ptr) -> c.void { print('DRAW CAPSULE') }
+C! closure drawSolidCapsule(p1: b2Vec2_C, p2: b2Vec2_C, radius: c.float, color: c.u32, context: c.ptr) -> c.void { print('DRAW SOLID CAPSULE') }
+C! closure drawSegment(p1: b2Vec2_C, p2: b2Vec2_C, color: c.u32, context: c.ptr) -> c.void { print('DRAW SEGMENT') }
+
+C! closure drawTransform(t: b2Transform_C, context: c.ptr) -> c.void { }
+
+C! closure drawString(p: b2Vec2_C, s: c.ptr, context: c.ptr) -> c.void {
+    drawText(p.0, p.1, c.as_str(s))
+}
+C! closure drawPoint(p: b2Vec2_C, r: c.float, color: c.u32, context: c.ptr) -> c.void { print('DRWA POINT') }
+
+C! struct b2DebugDraw
+{
+	/// Draw a closed polygon provided in CCW order.
+	/// void (*DrawPolygon)(const b2Vec2* vertices, int vertexCount, b2HexColor color, void* context);
+        c.ptr DrawPolygon;
+
+	/// Draw a solid closed polygon provided in CCW order.
+	// void (*DrawSolidPolygon)(b2Transform transform, const b2Vec2* vertices, int vertexCount, float radius, b2HexColor color, void* context);
+        c.ptr DrawSolidPolygon;
+
+	/// Draw a circle.
+	/// void (*DrawCircle)(b2Vec2 center, float radius, b2HexColor color, void* context);
+        c.ptr DrawCircle;
+
+	/// Draw a solid circle.
+	/// void (*DrawSolidCircle)(b2Transform transform, float radius, b2HexColor color, void* context);
+        c.ptr DrawSolidCircle;
+
+	/// Draw a capsule.
+	/// void (*DrawCapsule)(b2Vec2 p1, b2Vec2 p2, float radius, b2HexColor color, void* context);
+        c.ptr DrawCapsule;
+
+	/// Draw a solid capsule.
+	/// void (*DrawSolidCapsule)(b2Vec2 p1, b2Vec2 p2, float radius, b2HexColor color, void* context);
+        c.ptr DrawSolidCapsule;
+
+	/// Draw a line segment.
+	/// void (*DrawSegment)(b2Vec2 p1, b2Vec2 p2, b2HexColor color, void* context);
+        c.ptr DrawSegment;
+
+	/// Draw a transform. Choose your own length scale.
+	/// void (*DrawTransform)(b2Transform transform, void* context);
+        c.ptr DrawTransform;
+
+	/// Draw a point.
+	/// void (*DrawPoint)(b2Vec2 p, float size, b2HexColor color, void* context);
+        c.ptr DrawPoint;
+
+	/// Draw a string.
+	/// void (*DrawString)(b2Vec2 p, const char* s, void* context);
+        c.ptr DrawString;
+
+	/// Bounds to use if restricting drawing to a rectangular region
+	b2AABB_C drawingBounds;
+
+	/// Option to restrict drawing to a rectangular region. May suffer from unstable depth sorting.
+	c.u8 useDrawingBounds;
+
+	/// Option to draw shapes
+	c.u8 drawShapes;
+
+	/// Option to draw joints
+	c.u8 drawJoints;
+
+	/// Option to draw additional information for joints
+	c.u8 drawJointExtras;
+
+	/// Option to draw the bounding boxes for shapes
+	c.u8 drawAABBs;
+
+	/// Option to draw the mass and center of mass of dynamic bodies
+	c.u8 drawMass;
+
+	/// Option to draw contact points
+	c.u8 drawContacts;
+
+	/// Option to visualize the graph coloring used for contacts and joints
+	c.u8 drawGraphColors;
+
+	/// Option to draw contact normals
+	c.u8 drawContactNormals;
+
+	/// Option to draw contact normal impulses
+	c.u8 drawContactImpulses;
+
+	/// Option to draw contact friction impulses
+	c.u8 drawFrictionImpulses;
+
+	/// User context that is passed as an argument to drawing callback functions
+	c.ptr context;
+} b2DebugDraw;
+
+
+C! struct b2Polygon {
+	/// The polygon vertices
+	b2Vec2_C vertices[8];
+
+	/// The outward normal vectors of the polygon sides
+	b2Vec2_C normals[8];
+
+	/// The centroid of the polygon
+	b2Vec2_C centroid;
+
+	/// The external radius for rounded polygons
+	c.float radius;
+
+	/// The number of polygon vertices
+	c.i32 count;
+}
+
+C! struct b2Hull {
+	/// The final points of the hull
+	b2Vec2_C points[8];
+
+	/// The number of points
+	c.i32 count;
+}
+
+/// This holds the mass data computed for a shape.
+C! struct b2MassData {
+	/// The mass of the shape, usually in kilograms.
+	c.float mass;
+
+	/// The position of the shape's centroid relative to the shape's origin.
+	b2Vec2_C center;
+
+	/// The rotational inertia of the shape about the local origin.
+	c.float I;
+}
+
+/// A solid circle
+C! struct b2Circle {
+	/// The local center
+	b2Vec2_C center;
+
+	/// The radius
+	c.float radius;
+}
+
+/// A solid capsule can be viewed as two semicircles connected
+///	by a rectangle.
+C! struct b2Capsule {
+	/// Local center of the first semicircle
+	b2Vec2_C center1;
+	
+	/// Local center of the second semicircle
+	b2Vec2_C center2;
+
+	/// The radius of the semicircles
+	c.float radius;
+}
+
+/// The query filter is used to filter collisions between queries and shapes. For example,
+///	you may want a ray-cast representing a projectile to hit players and the static environment
+///	but not debris.
+/// @ingroup shape
+C! struct b2QueryFilter {
+	/// The collision category bits of this query. Normally you would just set one bit.
+	c.u32 categoryBits;
+
+	/// The collision mask bits. This states the shape categories that this
+	/// query would accept for collision.
+	c.u32 maskBits;
+}
+
+/// This is used to filter collision on shapes. It affects shape-vs-shape collision
+///	and shape-versus-query collision (such as b2World_CastRay).
+/// @ingroup shape
+C! struct b2Filter {
+	/// The collision category bits. Normally you would just set one bit. The category bits should
+	///	represent your application object types. For example:
+	///	@code{.cpp}
+	///	enum MyCategories
+	///	{
+	///	   Static  = 0x00000001,
+	///	   Dynamic = 0x00000002,
+	///	   Debris  = 0x00000004,
+	///	   Player  = 0x00000008,
+	///	   // etc
+	/// };
+	///	@endcode
+	c.u32 categoryBits;
+
+	/// The collision mask bits. This states the categories that this
+	/// shape would accept for collision.
+	///	For example, you may want your player to only collide with static objects
+	///	and other players.
+	///	@code{.c}
+	///	maskBits = Static | Player;
+	///	@endcode
+	c.u32 maskBits;
+
+	/// Collision groups allow a certain group of objects to never collide (negative)
+	/// or always collide (positive). A group index of zero has no effect. Non-zero group filtering
+	/// always wins against the mask bits.
+	///	For example, you may want ragdolls to collide with other ragdolls but you don't want
+	///	ragdoll self-collision. In this case you would give each ragdoll a unique negative group index
+	///	and apply that group index to all shapes on the ragdoll.
+	c.i32 groupIndex;
+} b2Filter;
+
+C! struct b2WorldDef {
+	/// Gravity vector. Box2D has no up-vector defined.
+	b2Vec2_C gravity;
+
+	/// Restitution velocity threshold, usually in m/s. Collisions above this
+	/// speed have restitution applied (will bounce).
+	c.float restitutionThreshold;
+
+	/// This parameter controls how fast overlap is resolved and has units of meters per second
+	c.float contactPushoutVelocity;
+
+	/// Threshold velocity for hit events. Usually meters per second.
+	c.float hitEventThreshold;
+
+	/// Contact stiffness. Cycles per second.
+	c.float contactHertz;
+
+	/// Contact bounciness. Non-dimensional.
+	c.float contactDampingRatio;
+
+	/// Joint stiffness. Cycles per second.
+	c.float jointHertz;
+
+	/// Joint bounciness. Non-dimensional.
+	c.float jointDampingRatio;
+
+	/// Can bodies go to sleep to improve performance
+	c.u8 enableSleep;
+
+	/// Enable continuous collision
+	c.u8 enableContinous;
+
+	/// Number of workers to use with the provided task system. Box2D performs best when using only
+	///	performance cores and accessing a single L2 cache. Efficiency cores and hyper-threading provide
+	///	little benefit and may even harm performance.
+	c.i32 workerCount;
+
+	/// Function to spawn tasks
+	c.ptr enqueueTask;
+
+	/// Function to finish a task
+	c.ptr finishTask;
+
+	/// User context that is provided to enqueueTask and finishTask
+	c.ptr userTaskContext;
+
+	/// Used internally to detect a valid definition. DO NOT SET.
+	c.i32 internalValue;
+}
+
+C! struct b2BodyDef {
+	/// The body type: static, kinematic, or dynamic.
+	c.int type;
+
+	/// The initial world position of the body. Bodies should be created with the desired position.
+	/// @note Creating bodies at the origin and then moving them nearly doubles the cost of body creation, especially
+	///	if the body is moved after shapes have been added.
+	b2Vec2_C position;
+
+	/// The initial world angle of the body in radians.
+	c.float angle;
+
+	/// The initial linear velocity of the body's origin. Typically in meters per second.
+	b2Vec2_C linearVelocity;
+
+	/// The initial angular velocity of the body. Typically in meters per second.
+	c.float angularVelocity;
+
+	/// Linear damping is use to reduce the linear velocity. The damping parameter
+	/// can be larger than 1 but the damping effect becomes sensitive to the
+	/// time step when the damping parameter is large.
+	///	Generally linear damping is undesirable because it makes objects move slowly
+	///	as if they are floating.
+	c.float linearDamping;
+
+	/// Angular damping is use to reduce the angular velocity. The damping parameter
+	/// can be larger than 1.0f but the damping effect becomes sensitive to the
+	/// time step when the damping parameter is large.
+	///	Angular damping can be use slow down rotating bodies.
+	c.float angularDamping;
+
+	/// Scale the gravity applied to this body. Non-dimensional.
+	c.float gravityScale;
+
+	/// Sleep velocity threshold, default is 0.05 meter per second
+	c.float sleepThreshold;
+
+	/// Use this to store application specific body data.
+	c.ptr userData;
+
+	/// Set this flag to false if this body should never fall asleep.
+	c.u8 enableSleep;
+
+	/// Is this body initially awake or sleeping?
+	c.u8 isAwake;
+
+	/// Should this body be prevented from rotating? Useful for characters.
+	c.u8 fixedRotation;
+
+	/// Treat this body as high speed object that performs continuous collision detection
+	/// against dynamic and kinematic bodies, but not other bullet bodies.
+	///	@warning Bullets should be used sparingly. They are not a solution for general dynamic-versus-dynamic
+	///	continuous collision. They may interfere with joint constraints.
+	c.u8 isBullet;
+
+	/// Used to disable a body. A disabled body does not move or collide.
+	c.u8 isEnabled;
+
+	/// Automatically compute mass and related properties on this body from shapes.
+	/// Triggers whenever a shape is add/removed/changed. Default is true.
+	c.u8 automaticMass;
+
+	/// Used internally to detect a valid definition. DO NOT SET.
+	c.i32 internalValue;
+}
+
+C! struct b2ShapeDef {
+	/// Use this to store application specific shape data.
+	c.ptr userData;
+
+	/// The Coulomb (dry) friction coefficient, usually in the range [0,1].
+	c.float friction;
+
+	/// The restitution (bounce) usually in the range [0,1].
+	c.float restitution;
+
+	/// The density, usually in kg/m^2.
+	c.float density;
+
+	/// Collision filtering data.
+	b2Filter_C filter;
+
+	/// A sensor shape generates overlap events but never generates a collision response.
+	c.u8 isSensor;
+
+	/// Enable sensor events for this shape. Only applies to kinematic and dynamic bodies. Ignored for sensors.
+	c.u8 enableSensorEvents;
+
+	/// Enable contact events for this shape. Only applies to kinematic and dynamic bodies. Ignored for sensors.
+	c.u8 enableContactEvents;
+
+	/// Enable hit events for this shape. Only applies to kinematic and dynamic bodies. Ignored for sensors.
+	c.u8 enableHitEvents;
+
+	/// Enable pre-solve contact events for this shape. Only applies to dynamic bodies. These are expensive
+	///	and must be carefully handled due to threading. Ignored for sensors.
+	c.u8 enablePreSolveEvents;
+
+	/// Normally shapes on static bodies don't invoke contact creation when they are added to the world. This overrides
+	///	that behavior and causes contact creation. This significantly slows down static body creation which can be important
+	///	when there are many static shapes.
+	c.u8 forceContactCreation;
+
+	/// Used internally to detect a valid definition. DO NOT SET.
+	c.i32 internalValue;
+}
+
+C! box2d function b2DefaultWorldDef() -> b2WorldDef
+C! box2d function b2DefaultBodyDef() -> b2BodyDef
+C! box2d function b2DefaultShapeDef() -> b2ShapeDef
+C! box2d function b2CreateWorld(c.ptr worldDef) -> b2WorldId
+C! box2d function b2CreateBody(b2WorldId world, c.ptr bodyDef) -> b2BodyId
+C! box2d function b2CreatePolygonShape(b2BodyId bodyId, c.ptr shapeDef, c.ptr polygon) -> b2ShapeId
+C! box2d function b2MakeBox(c.float w, c.float h) -> b2Polygon
+C! box2d function b2MakeRoundedBox(c.float w, c.float h, c.float radius) -> b2Polygon
+C! box2d function b2MakePolygon(b2Hull hull, c.float radius) -> b2Polygon
+C! box2d function b2World_Step(b2WorldId worldId, c.float timeStep, c.int subStepCount) -> c.void
+C! box2d function b2World_Draw(b2WorldId worldId, b2DebugDraw) -> c.void
+C! box2d function b2Body_GetPosition(b2BodyId bodyId) -> b2Vec2
+C! box2d function b2Body_GetAngle(b2BodyId bodyId) -> c.float
+C! box2d function b2Body_GetLinearVelocity(b2BodyId bodyId) -> b2Vec2
+C! box2d function b2Body_SetLinearVelocity(b2BodyId bodyId, b2Vec2_C linearVelocity) -> c.void
+C! box2d function b2ComputeHull(c.ptr points, c.i32 count) -> b2Hull
+C! box2d function b2World_SetPreSolveCallback(b2WorldId worldId, c.ptr preSolveFunc, c.ptr context) -> c.void
+C! box2d function b2Shape_EnablePreSolveEvents(b2ShapeId shapeId, c.u8 flag) -> c.void
+C! box2d function b2Shape_GetAABB(b2ShapeId shapeId) -> b2AABB
+C! box2d function b2Shape_GetPolygon(b2ShapeId shapeId) -> b2Polygon
+C! box2d function b2DefaultFilter() -> b2Filter
+C! box2d function b2DefaultQueryFilter() -> b2QueryFilter
+
+/// typedef float b2CastResultFcn(b2ShapeId shapeId, b2Vec2 point, b2Vec2 normal, float fraction, void *context)
+C! box2d function b2World_CastPolygon(b2WorldId worldId, b2Polygon poly, b2Transform originTransform, b2Vec2 translation, b2QueryFilter filter, c.ptr func, c.ptr context) -> c.void
+C! box2d function b2World_CastCapsule(b2WorldId worldId, c.ptr capsule, b2Transform originTransform, b2Vec2 translation, b2QueryFilter filter, c.ptr func, c.ptr context) -> c.void
+C! box2d function b2World_CastRay(b2WorldId worldId, b2Vec2 origin, b2Vec2 translation, b2QueryFilter filter, c.ptr func, c.ptr context) -> c.void
+
+C! closure preSolve(a: b2ShapeId_C, b: b2ShapeId_C, ctx: c.ptr) -> c.u8 {
+    //print(b2Shape_GetAABB(a), b2Shape_GetAABB(b))
+    1
+}
+
+let worldDef = b2DefaultWorldDef()
+worldDef.gravity = (0, -500)
+
+let worldId = b2CreateWorld(worldDef)
+
+let groundBodyDef = b2DefaultBodyDef()
+groundBodyDef.position = (0, -30.0)
+
+let groundId = b2CreateBody(worldId, groundBodyDef)
+
+let groundBox = b2MakeBox(5000.0, 30.0);
+let groundShapeDef = b2DefaultShapeDef()
+b2CreatePolygonShape(groundId, groundShapeDef, groundBox)
+
+/*
+let bodyDef = b2DefaultBodyDef()
+bodyDef.type = b2_kinematicBody
+bodyDef.position = (15.0, 100.0);
+bodyDef.enableSleep = 0
+let bodyId = b2CreateBody(worldId, bodyDef)
+
+let dynamicBox = b2MakeRoundedBox(15.0, 25.0, 5)
+let shapeDef = b2DefaultShapeDef()
+shapeDef.density = 5.0
+shapeDef.friction = 0.3
+b2CreatePolygonShape(bodyId, shapeDef, dynamicBox)
+
+b2Shape_EnablePreSolveEvents(bodyId, 1)
+
+dbg(preSolve)
+b2World_SetPreSolveCallback(worldId, preSolve, nil)
+*/
+
+let timeStep = 1.0 / 60.0
+let subStepCount = 4
+
+pub function addShapes(polys) {
+    let buf = ptr.typed(c.alloc(c.size(b2Vec2_C) * 8), b2Vec2_C)
+    for poly in polys {
+        let poly = poly
+        print(poly)
+        for (x, y), i in poly {
+            let vert = b2Vec2(buf + i)
+            vert.x = x
+            vert.y = y
+            print(vert)
+        }
+
+        let hull = b2ComputeHull(buf, #poly)
+
+        let tileBodyDef = b2DefaultBodyDef()
+        tileBodyDef.position = (0, 0)
+
+        let tileId = b2CreateBody(worldId, tileBodyDef)
+
+        let tilePoly = b2MakePolygon(hull, 0.0)
+        let tileShapeDef = b2DefaultShapeDef()
+        let tileShape = b2CreatePolygonShape(tileId, tileShapeDef, tilePoly)
+    }
+}
+
+pub function draw(f) {
+    if drawPoly == nil {
+        drawPoly = f
+
+        debugDraw = b2DebugDraw()
+        c.memset(debugDraw, 0, c.size(b2DebugDraw_C))
+        debugDraw.DrawPolygon = drawPolygon
+        debugDraw.DrawSolidPolygon = drawSolidPolygon
+        debugDraw.DrawPoint = drawPoint
+        debugDraw.DrawSegment = drawSegment
+        debugDraw.DrawCircle = drawCircle
+        debugDraw.DrawSolidCircle = drawSolidCircle
+        debugDraw.DrawString = drawString
+        debugDraw.DrawCapsule = drawCapsule
+        debugDraw.DrawSolidCapsule = drawSolidCapsule
+        debugDraw.DrawTransform = drawTransform
+        debugDraw.drawShapes = 1
+        debugDraw.drawMass = 1
+    }
+
+    b2World_Draw(worldId, debugDraw)
+}
+
+let xOut = nil
+let yOut = nil
+let onGround = false
+let onWall = 0
+
+pub function angleDiff(x1, y1, x2, y2) {
+    let diff = atan2(y1, x1) - atan2(y2, x2)
+
+    while diff > pi {
+        diff -= 2*pi
+    }
+
+    while diff < -pi {
+        diff += 2*pi
+    }
+
+    return diff
+}
+
+C! closure handleCastResult(shapeId: b2ShapeId_C, point: b2Vec2_C, normal: b2Vec2_C, fraction: c.float, context: c.ptr) -> c.float {
+    let (nx, ny) = normal
+    let (x, y) = point
+
+    if abs(angleDiff(nx, ny, -0.707, 0.707)) < pi/8 {
+        xOut = x + 4
+        yOut = y + 4
+    } else if abs(angleDiff(nx, ny, 0.707, 0.707)) < pi/8 {
+        xOut = x - 4
+        yOut = y + 4
+    } else if abs(angleDiff(nx, ny, -1, 0)) < pi/8 {
+        xOut = x - 0.5
+        onWall = -1
+    } else if abs(angleDiff(nx, ny, 1, 0)) < pi/8 {
+        xOut = x + 0.5
+        onWall = 1
+    }
+
+    //print("handleCastResult: point={point}, normal={normal}, out=({xOut}, {yOut})")
+
+    return 1.0
+}
+
+C! closure doGroundCheck(shapeId: b2ShapeId_C, point: b2Vec2_C, normal: b2Vec2_C, fraction: c.float, context: c.ptr) -> c.float {
+    let (nx, ny) = normal
+    let (x, y) = point
+
+    yOut = max(yOut ?? 0, y + 0.001)
+    onGround = true
+
+    //print("doGroundCheck: y = {yOut}")
+
+    return 1.0
+}
+
+let queryFilter = b2DefaultQueryFilter()
+
+pub function update(x, y, dx, dy) {
+    xOut = yOut = nil
+    onGround = false
+    onWall = 0
+
+    b2World_CastRay(worldId, (x, y + 36), (dx, 0), queryFilter, handleCastResult, nil)
+
+    if dy <= 0 {
+        b2World_CastRay(worldId, (x, y + 36), (0, dy - 36), queryFilter, doGroundCheck, nil)
+    }
+
+    //print("({x#.1f} + {dx#.1f}, {y#.1f} + {dy ?? 0#.1f})   {({xOut, yOut})}")
+
+    return {
+        x: xOut ?? (x + dx),
+        y: yOut ?? (y + (dy ?? 0)),
+        grounded: onGround,
+        walled: onWall != 0,
+        wallDirection: onWall,
+        msg: '',
+        collisions: []
+    }
+}
+
+pub function lerp(p1, p2, t) {
+    let (x1, y1) = p1
+    let (x2, y2) = p2
+    let dx = x2 - x1
+    let dy = y2 - y1
+    return (x1 + dx*t, y1 + dy*t)
+}

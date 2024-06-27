@@ -1,0 +1,685 @@
+import ffi as c (C!)
+import ty (gc)
+import raylib (..)
+import tiles (Tilemap)
+import math (pow)
+import ptr
+import box2d
+import readln (readln)
+import tp (Future)
+
+let WIN_HEIGHT = 600
+let WIN_WIDTH = 800
+
+let sgn = x -> (x <=> 0.0)
+
+class DashState {
+    init() {
+        @active = false
+        @t = 0.0
+        @c = 1.0
+    }
+
+    update(dt, wantDash) {
+        let special = wantDash && if @active {
+            true
+        } else if @t == 0.0 {
+            @active = true
+            @c = 8.0
+            false
+        } else {
+            false
+        }
+
+        if @t < 0 {
+            @t = min(@t + dt, 0.0)
+        } else if @active {
+            @t += dt
+            @c = 5.0 * pow(0.96, @t / (1.0/60.0))
+        }
+
+        if @active && @c <= 1.0 {
+            @active = false
+            @t = -0.5
+        }
+
+        return (@active ? @c : 1.0, special)
+    }
+
+    reset() {
+        @active = false
+        @t = -0.5
+    }
+}
+
+class JumpState {
+    init() {
+        @n = 0
+        @keyDown = false
+    }
+
+    update(keyDown) {
+        let jump = if keyDown && !@keyDown && @n < 2 {
+            @n += 1
+            true
+        } else {
+            false
+        }
+            
+        @keyDown = keyDown
+
+        return jump
+    }
+
+    reset() {
+        @n = 0
+        @keyDown = false
+    }
+
+    softReset() {
+        @n = 1
+    }
+
+    active {
+        @n > 0
+    }
+
+    count {
+        @n
+    }
+}
+
+class Character {
+    init(directory, width, height, scale, *animations) {
+        @animations = %{}
+        @scale = scale
+        @width = width
+        @height = height
+
+        for { name, path, duration } in animations {
+            let texture = LoadTexture(c.cstr("{directory}/{path}"))
+            dbg(@animations[name] = {
+                texture: texture,
+                duration: duration,
+                lines: texture.height / height,
+                cols: texture.width / width,
+            })
+        }
+
+        @t = 0.0
+        @activeAnimation = nil
+    }
+
+    start(name) {
+        @activeAnimation = @animations[name]
+        @t = 0.0
+    }
+
+    stopAnimation(name) {
+        if @activeAnimation != nil && @activeAnimation.texture == @animations[name].texture {
+            @activeAnimation = nil
+            @t = 0.0
+        }
+    }
+
+    draw(dt, base, x, y, flip, rotation) {
+        let { texture, duration, lines, cols } = @activeAnimation ?? @animations[base]
+
+        let eFrame = (int((@t / duration) * lines * cols) % (lines * cols))
+
+        let i = eFrame / cols
+        let j = eFrame % cols
+
+        DrawTexturePro(
+            texture,
+            (j * @width, i * @height, flip ? -@width : @width, @height),
+            (x, WIN_HEIGHT - y - @scale * @height / 2, @width * @scale, @height * @scale),
+            (@width / 2 * @scale, @scale * @height / 2),
+            rotation,
+            WHITE
+        )
+
+        @t += dt
+        
+        if @t > duration && @activeAnimation != nil {
+            @activeAnimation = nil
+            @t = 0.0
+        }
+    }
+
+    getHitbox(x, y) {
+        (x - @width * @scale / 2, y, @width * @scale, @height * @scale)
+    }
+}
+
+class ParallaxGroup {
+    init(*layers) {
+        @layers = [{*layer, off: 0.0} for layer in layers]
+    }
+
+    draw(xOff) {
+        for layer in @layers {
+            let { texture, off, y, rate } = layer
+
+            DrawTexturePro(
+                texture,
+                Rectangle(width: texture.width, height: texture.height, x: off, y: 0),
+                Rectangle(width: WIN_WIDTH, height: WIN_HEIGHT, x: 0, y: 0),
+                Vector2(x: 0, y: 0),
+                0,
+                WHITE
+            )
+
+            layer.off = xOff * rate
+        }
+    }
+}
+
+class LoopingAnimation {
+    init(texture, duration, lines, cols, off=0, n = lines * cols - off, scale = 1.0) {
+        @texture = texture
+        @duration = duration
+        @lines = lines
+        @cols = cols
+        @off = off
+        @nFrames = n
+        @scale = scale
+        @width = texture.width / cols
+        @height = texture.height / lines
+        @rect = Rectangle(width: texture.width / cols, height: texture.height / lines)
+        @dest = Rectangle(width: @width * scale, height: @height * scale, x: 0, y: 0)
+        @origin = Vector2(x: 0, y: 0)
+    }
+
+    draw(x, y, t) {
+        let eFrame = @off + (int((t / @duration) * @nFrames) % @nFrames)
+
+        let i = eFrame / @lines
+        let j = eFrame % @cols
+        @rect.x = j * @width
+        @rect.y = i * @height
+
+        @dest.x = x - @width / 2
+        @dest.y = WIN_HEIGHT - y - @height * @scale
+
+        DrawTexturePro(@texture, @rect, @dest, @origin, 0, WHITE)
+    }
+
+}
+
+class LoopingAnimationState {
+    init(*args, %kwargs) {
+        @animation = LoopingAnimation(*args, **kwargs)
+        @t = 0.0
+    }
+
+    draw(dt, x, y) {
+        @animation.draw(x, y, @t)
+        @t += dt
+    }
+}
+
+class AnimationGroup {
+    init(texture, duration, lines, cols) {
+        @texture = texture
+        @duration = duration
+        @active = []
+        @lines = lines
+        @cols = cols
+        @width = texture.width / cols
+        @height = texture.height / lines
+        @rect = Rectangle(width: texture.width / cols, height: texture.height / lines)
+        @pos = Vector2()
+    }
+
+    start(x, y) {
+        @active.push({
+            x: x,
+            y: y,
+            elapsed: 0.0
+        })
+    }
+
+    draw(dt) {
+        @active.filter!(${it.elapsed < @duration})
+
+        for a in @active {
+            let { elapsed, x, y } = a
+
+            let eFrame = int((elapsed / @duration) * @cols * @lines)
+
+            let i = eFrame / @lines
+            let j = eFrame % @cols
+            @rect.x = j * @width
+            @rect.y = i * @height
+
+            @pos.x = x - @width / 2
+            @pos.y = y - @height / 2
+
+            DrawTextureRec(@texture, @rect, @pos, WHITE)
+
+            a.elapsed += dt
+        }
+    }
+
+    ready?(dt) {
+        @active.all?(${it.elapsed > dt})
+    }
+}
+
+function LoadGIF(path) {
+    let out = c.new(c.int)
+    let image = LoadImageAnim(path, out)
+    let frames = out[0]
+    c.free(out)
+    (image, frames)
+}
+
+
+//SetConfigFlags(FLAG_VSYNC_HINT)
+
+SetTargetFPS(144)
+
+InitWindow(WIN_WIDTH, WIN_HEIGHT, '..')
+
+let font = LoadFontEx('/Users/brad/Library/Fonts/BerkeleyMono-Regular.ttf', 48, nil, 0)
+
+let (img, frames) = LoadGIF('run.gif')
+let texture = LoadTextureFromImage(img)
+
+let showHitboxes = false
+
+let player = Character(
+    'FreeKnight_v1/Colour1/Outline/120x80_PNGSheets',
+    120, 80,
+    2.5,
+    { name: 'idle', path: '_Idle.png', duration: 1.0 },
+    { name: 'running', path: '_Run.png', duration: 0.6 },
+    { name: 'attack', path: '_Attack.png', duration: 0.3 },
+    { name: 'attack2', path: '_Attack2.png', duration: 0.3 },
+    { name: 'combo', path: '_AttackCombo2hit.png', duration: 0.5 },
+    { name: 'jump', path: '_Jump.png', duration: 1.2 }
+)
+
+let demon = Character(
+    'demon/Sprites/with_outline',
+    81, 71,
+    2.8,
+    { name: 'idle', path: 'IDLE.png', duration: 1.0 },
+    { name: 'flying', path: 'FLYING.png', duration: 0.6 },
+    { name: 'attack', path: 'ATTACK.png', duration: 0.3 },
+    { name: 'death', path: 'DEATH.png', duration: 0.3 },
+    { name: 'hurt', path: 'HURT.png', duration: 0.3 }
+)
+
+let fireballAnimation = LoopingAnimation(LoadTexture('fireball.png'), 0.4, 1, 4, scale: 3.0)
+
+let explosion = LoadTexture('explode2.png')
+let magic = LoadTexture('ring_blueish_flame.png')
+
+let spells = AnimationGroup(magic, 2.0, 5, 8)
+let explosions = AnimationGroup(explosion, 0.8, 1, 12)
+let magicExplosions = AnimationGroup(LoadTexture('preset_explosion_blueish.png'), 1.5, 5, 6)
+let fireballs = []
+
+let mage = {
+    animation: LoopingAnimationState(LoadTexture('spritesheets/mage-2-122x110.png'), 1.0, 2, 4, scale: 1.5),
+    x: 200,
+    y: 0,
+    alive: true
+}
+
+let bg = ParallaxGroup(
+    { texture: LoadTexture('parallax_mountain_pack/layers/parallax-mountain-bg.png'), rate: 0.0, y: 0 },
+    { texture: LoadTexture('parallax_mountain_pack/layers/parallax-mountain-montain-far.png'), rate: 3.4, y: 200 },
+    { texture: LoadTexture('parallax_mountain_pack/layers/parallax-mountain-mountains.png'), rate: 15.4, y: 0 },
+    { texture: LoadTexture('parallax_mountain_pack/layers/parallax-mountain-trees.png'), rate: 20.4, y: 0 },
+    { texture: LoadTexture('parallax_mountain_pack/layers/parallax-mountain-foreground-trees.png'), rate: 40.4, y: 0 }
+)
+
+let tilemap = Tilemap('/Users/brad', 'map1.tmx')
+let demonLocation = tilemap.getPoint('enemy')
+
+let colliders = tilemap.getColliders()
+box2d.addShapes(colliders)
+
+let x = 0.0
+let y = 2.0
+let vy = 0.0
+let vxRun = 0.0
+let vxKnock = 0.0
+let jump = JumpState()
+let dash = DashState()
+let elapsed = 0.0
+let SPEED = 200
+let GRAVITY = 4400
+let ACCEL = 3000
+let KNOCK_SPEED = 500
+
+let flip = false
+
+let rect = Rectangle()
+let vec = Vector2(x: texture.height / 2, y: texture.width / 2)
+let dest = Rectangle(width: texture.width, height: texture.height)
+let camera = Camera2D(target: (0, 0), offset: (WIN_WIDTH / 2, 0), rotation: 0, zoom: 1)
+
+InitAudioDevice()
+let music = LoadMusicStream('TownTheme.mp3')
+print(music)
+
+let boom = LoadSound('boom.wav')
+let deathSound = LoadSound('death.wav')
+
+let center = Vector2()
+
+function startExplosion(x, y) {
+    explosions.start(x, y)
+    PlaySound(boom)
+
+    center.x = x
+    center.y = y
+
+    if CheckCollisionCircleRec(center, 60, mage.animation.animation.dest) {
+        mage.alive = false
+    }
+}
+
+function drawFireballs(fireballs, dt) {
+    for fireball in fireballs {
+        //fireballAnimation.draw(fireball.x, fireball.y, fireball.elapsed)
+        fireball.x += fireball.v * dt
+        fireball.elapsed += dt
+    }
+}
+
+let colorMap = %{*: mkcolor(*it) }
+
+let toGame = Channel()
+let toWatch = Channel()
+let toEval = Channel()
+let watchExprs = %{}
+
+let evalThread = Thread(function () {
+    while let $expr = readln('debug> ', erase: false) {
+        if let [_, expr] = expr.match!(/^watch (.*)$/) {
+            toWatch.send(expr)
+        } else {
+            toGame.send(expr)
+            let Some(result) = toEval.recv()
+            print(result)
+        }
+    }
+})
+
+function doAttack() {
+    player.start(rand(['attack', 'attack2', 'combo']))
+    if CheckCollisionRecs(
+        (x + (flip ? -120 : 0), y + 8, 120, 90),
+        demon.getHitbox(demonLocation.x, demonLocation.y)
+    ) {
+        PlaySound(deathSound)
+        demon.start('death')
+    }
+}
+
+let grounded = true
+let wallJumpBuffer = 0.3
+let wallJumpTimer = 0.0
+let wallDirection = 0
+
+while !WindowShouldClose() {
+    let dt = GetFrameTime()
+
+    if !IsMusicStreamPlaying(music) {
+        dbg(IsAudioDeviceReady())
+        dbg(IsMusicReady(music))
+        PlayMusicStream(music)
+        SetMusicVolume(music, 0.1)
+        SetMusicPitch(music, 1.2)
+    }
+
+    UpdateMusicStream(music)
+
+    let moving = false
+    let running = false
+
+    let dx = 0.0
+
+    let speed = if IsKeyDown(KEY_LEFT_SHIFT) {
+        SPEED * 2.0
+    } else {
+        SPEED
+    }
+
+    let (speedMultiplier, doSpecial) = dash.update(dt, IsKeyPressed(KEY_C) && speed > SPEED)
+    speed *= speedMultiplier
+
+    if doSpecial {
+        if !flip && demonLocation.x > x {
+            x = demonLocation.x + 80
+            flip = true
+            doAttack()
+            dash.reset()
+        } else if flip && demonLocation.x < x {
+            x = demonLocation.x - 15
+            flip = false
+            doAttack()
+            dash.reset()
+        }
+    }
+
+    if grounded && (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D)) {
+        vxRun += ACCEL * dt
+        running = true
+        flip = false
+    }
+
+    if grounded && IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A) {
+        vxRun -= ACCEL * dt
+        running = true
+        flip = true
+    }
+
+    if grounded { player.stopAnimation('jump') }
+
+    if grounded && !running {
+        vxRun = 0.0
+    }
+
+    vxRun = vxRun.clamp(-speed, speed)
+    moving = vxRun != 0.0
+
+    if IsKeyDown(KEY_Q) && spells.ready?(0.2) {
+        spells.start(dest.x + (flip ? -100 : 100), dest.y + 20)
+    }
+
+    if IsKeyDown(KEY_R) && magicExplosions.ready?(0.2) {
+        magicExplosions.start(dest.x, dest.y)
+        mage.alive = true
+    }
+
+    if IsKeyDown(KEY_F) && (#fireballs == 0 || fireballs[-1].elapsed > 0.4) {
+        doAttack()
+        fireballs.push({
+            x: x,
+            y: y + 64,
+            v: (flip ? -1 : 1) * (moving ? 3 : 2) * speed
+            elapsed: 0.0
+        })
+    }
+
+    if IsKeyPressed(KEY_H) {
+        showHitboxes = !showHitboxes
+    }
+
+    let offset = 4 * (int(elapsed * frames) % frames) * img.height * img.width
+    UpdateTexture(texture, img.data + offset)
+
+    if running {
+        elapsed += dt * speed / SPEED
+    }
+
+    fireballs.filter!(${it.elapsed < 3})
+
+    for fireball in [] {
+        if mage.alive && CheckCollisionCircles(
+            (fireball.x, fireball.y),
+            16,
+            (mage.x, mage.y),
+            50
+        ) {
+            startExplosion(mage.x, WIN_HEIGHT - mage.y - 50)
+        }
+    }
+
+    if jump.update(IsKeyDown(KEY_SPACE)) {
+        player.start('jump')
+        vy = 1800.0 / jump.count
+        if !grounded && wallJumpTimer > 0.0 {
+            vxKnock = KNOCK_SPEED * wallDirection
+            vxRun = 80 * wallDirection
+            flip = wallDirection == -1
+        }
+    }
+
+    if wallJumpTimer < dt {
+        wallDirection = 0
+        wallJumpTimer = 0.0
+    } else {
+        wallJumpTimer -= dt
+    }
+
+    let vxTotal = vxRun + vxKnock
+    let dx = dt * vxTotal
+    let dy = dt * vy
+
+    let playerState = box2d.update(x, y, dx, dy)
+
+    if playerState.grounded {
+        vy = -600.0
+        vxKnock = 0.0
+        jump.reset()
+    }
+
+    if playerState.walled {
+        vxRun = vxRun.clamp(-80.0, 80.0)
+        wallJumpTimer = wallJumpBuffer
+        wallDirection = playerState.wallDirection
+        if sgn(wallDirection) != sgn(vxKnock) {
+            vxKnock = 0.0
+        }
+    }
+
+    if jump.active || !playerState.grounded {
+        vy -= GRAVITY * dt
+    }
+
+    if playerState.walled && !playerState.grounded {
+        vy = vy.clamp(-180.0, 50000.0)
+        jump.softReset()
+    }
+
+    x = playerState.x
+    y = playerState.y
+    grounded = playerState.grounded
+
+    let (cameraX, _) = box2d.lerp(camera.target, (x, y), 8*dt)
+    let (_, cameraY) = box2d.lerp(camera.target, (x, (375 - y).clamp(-800.0, 0.0)), 5*dt)
+
+    camera = Camera2D(
+        camera.get(),
+        target: (cameraX, cameraY)
+    )
+
+    while let Some(expr) = toWatch.recv(0) {
+        watchExprs[expr] = nil
+    }
+
+    while let Some(expr) = toGame.recv(0) {
+        try {
+            let z = __eval__(expr)
+            toEval.send("{z}" || 'nil')
+        } catch Err(e) {
+            toEval.send(e)
+        }
+    }
+
+    for e, v in watchExprs {
+        let z = "{__eval__(e)}"
+        if z != v { print("\r{e} = {z}") }
+        watchExprs[e] = z
+    }
+
+    BeginDrawing()
+        ClearBackground(BLACK)
+        bg.draw(camera.target.0 / 50.0)
+        DrawFPS(8, 8)
+        BeginMode2D(camera)
+            tilemap.draw()
+            //DrawText('Hello!', int(x), 40, 48, RED)
+
+            //DrawTexture(texture, int(x), int(y), WHITE)
+            let source = Rectangle(
+                rect.get(),
+                x: 0.0,
+                y: 0.0,
+                height: img.height,
+                width: flip ? -img.width : img.width
+            )
+
+            dest.x = x
+            dest.y = WIN_HEIGHT - texture.height / 2 - y
+
+            let rotation = (flip ? -1 : 1) * min((!running || jump.active) ? 0 : 15 * (speed / SPEED), 18)
+
+            //DrawTexturePro(texture, source, dest, vec, rotation, WHITE)
+            player.draw(dt * speed / SPEED, running ? 'running' : 'idle', flip ? x - 10 : x + 10, y - 6, flip, rotation)
+            demon.draw(dt, 'idle', *demonLocation, false)
+
+            explosions.draw(dt)
+            spells.draw(dt)
+            magicExplosions.draw(dt)
+            drawFireballs(fireballs, dt)
+
+            if showHitboxes {
+                {
+                    let (x, y, w, h) = demon.getHitbox(*demonLocation)
+                    DrawRectangleLinesEx((x, WIN_HEIGHT - y - h, w, h), 4, WHITE)
+                }
+
+                DrawRectangleLinesEx((x + (flip ? -120 : 0), WIN_HEIGHT - (y + 8 + 90), 120, 90), 4, WHITE)
+            }
+
+            /*
+            let buf = ptr.typed(c.alloc(c.size(Vector2_C) * 10), Vector2_C)
+            function drawPoly(poly, color) {
+                let poly = poly + [poly[0]]
+                for (x, y), i in poly {
+                    let vert = Vector2(buf + i)
+                    vert.x = x
+                    vert.y = WIN_HEIGHT - y
+                }
+                DrawLineStrip(buf, #poly, colorMap[color])
+            }
+
+            box2d.draw(drawPoly)
+
+            DrawRectangleLinesEx((x - 20, WIN_HEIGHT - (y + 50), 40, 50), 3, WHITE)
+            */
+
+            //DrawRectangleLinesEx((x - 20, WIN_HEIGHT - y - 48, 40, 48), 2, RED)
+
+            gc()
+        EndMode2D()
+
+        DrawTextEx(font, c.cstr("(x: {x#.2f}, y: {y#.2f}) ({playerState.msg})"), (0, 500.0), 18.0, 0.0, GREEN)
+        DrawTextEx(font, c.cstr("{playerState}"), (0, 524.0), 18.0, 0.0, GREEN)
+        DrawTextEx(font, c.cstr("(vxRun: {vxRun}, vxKnock: {vxKnock})"), (0, 548.0), 18.0, 0.0, GREEN)
+
+        if showHitboxes {
+            for collision, i in playerState.collisions {
+                DrawTextEx(font, c.cstr(collision), (0, 240.0 + 24 * i), 18.0, 0.0, WHITE)
+            }
+        }
+    EndDrawing()
+}

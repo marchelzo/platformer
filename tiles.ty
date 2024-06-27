@@ -1,0 +1,140 @@
+import xml (..)
+import os (args)
+import raylib (..)
+import ffi as c
+
+class Tileset {
+    init(directory, filename) {
+        let doc = XMLNode(xmlParseFile(c.cstr("{directory}/{filename}")))
+
+        let tileset = doc.children.find(${it.name == 'tileset'})
+        let tilesetChildren = tileset.children
+
+        let colliders = %{}
+
+        for child in tilesetChildren if child.name == 'tile' {
+            if let $group = child.children.find(${it.name == 'objectgroup'}) {
+                let collider = nil
+                for object in group.children.filter(${it.name == 'object'}) {
+                    let props = object.properties
+                    if 'width' in props {
+                        let w = float(props['width'])
+                        let h = float(props['height'])
+                        collider = [
+                            (0, 0),
+                            (w, 0),
+                            (w, h),
+                            (0, h)
+                        ]
+                        break
+                    }
+                    if let $poly = object.children.find(${it.name == 'polygon'}) {
+                        let x = float(props['x'])
+                        let y = float(props['y'])
+                        let points = poly.properties['points'].words().map(&split(',') |> &map(float))
+                        collider = [(x, y)] + [(x + dx, y + dy) for [dx, dy] in points]
+                        break
+                    }
+                }
+                colliders[int(child.properties['id'])] = collider
+            }
+        }
+
+        @colliders = colliders
+
+        print(colliders)
+
+        let image = tilesetChildren.find(${it.name == 'image'})
+
+        print('tileset', tileset.properties)
+        print('image', image.properties)
+
+        let tilesetProps = tileset.properties
+        let imageProps = image.properties
+
+        @texture = LoadTexture(c.cstr("{directory}/{imageProps['source']}"))
+        @tileWidth = int(tilesetProps['tilewidth'])
+        @tileHeight = int(tilesetProps['tileheight'])
+        @columns = int(tilesetProps['columns'])
+        @tileCount = int(tilesetProps['tilecount'])
+        @lines = @tileCount / @columns
+    }
+
+    draw(tile, x, y) {
+        if tile == 0 {
+            return
+        }
+
+        tile -= 1
+
+        let i = tile / @columns
+        let j = tile % @columns
+
+        DrawTexturePro(
+            @texture,
+            (j * @tileWidth, i * @tileHeight, @tileWidth, @tileHeight),
+            (x * @tileWidth, (y - 1) * @tileHeight, @tileWidth, @tileHeight),
+            (0, 0),
+            0,
+            WHITE
+        )
+    }
+}
+
+class Tilemap {
+    init(directory, filename) {
+        let doc = XMLNode(xmlParseFile(c.cstr("{directory}/{filename}")))
+        let map = doc.children.find(${it.name == 'map'})
+        let tileset = map.children.find(${it.name == 'tileset'})
+        let layer = map.children.find(${it.name == 'layer'})
+        let data = layer.children.find(${it.name == 'data'})
+
+        (%{ 'height': int ~> @height, 'width': int ~> @width } = layer.properties)
+
+        @tiles = Tileset(directory, tileset.properties['source'])
+        @map = data.content.comb(/\s/).split(',').map(int)
+
+        print(@map)
+        @points = %{}
+
+        for group in map.children.filter(${it.name == 'objectgroup'}) {
+            for object in group.children.filter(${it.name == 'object'}) {
+                let props = object.properties
+                @points[props['name']] = (x: float(props['x']), y: @height * @tiles.tileHeight - float(props['y']))
+            }
+        }
+    }
+
+    getPoint(name) {
+        return @points[name]
+    }
+
+    draw() {
+        for i in .. @height {
+            for j in .. @width {
+                @tiles.draw(@map[i * @width + j], j, i)
+            }
+        }
+    }
+
+    getColliders() {
+        let colliderMap = @tiles.colliders
+        let colliders = []
+
+        let totalHeight = @height * @tiles.tileHeight
+
+        dbg(totalHeight)
+
+        for i in .. @height {
+            for j in .. @width {
+                if let $collider = colliderMap[@map[i * @width + j] - 1] {
+                    let dx = j * @tiles.tileWidth
+                    let dy = i * @tiles.tileHeight
+                    colliders.push([(x + dx, totalHeight - y - dy - 6) for (x, y) in collider])
+                }
+            }
+        }
+
+        return colliders
+    }
+}
